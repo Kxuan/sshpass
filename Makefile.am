@@ -1,6 +1,7 @@
 bin_PROGRAMS=sshpass
 man_MANS = sshpass.1
 EXTRA_DIST = $(man_MANS)
+LIBADD = -lcrypto
 
 VERSION = @PACKAGE_VERSION@
 PACKAGE = @PACKAGE_NAME@

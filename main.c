@@ -37,6 +37,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
+#include <stdint.h>
+#include <netinet/in.h>
+#include <time.h>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <pty.h>
 
 enum program_return_codes
 {
@@ -49,6 +56,24 @@ enum program_return_codes
     RETURN_HOST_KEY_UNKNOWN,
     RETURN_HOST_KEY_CHANGED,
 };
+typedef enum
+{
+    QUESTION_HOST_KEY_CHANGED,
+    QUESTION_HOST_KEY_VERIFY,
+    QUESTION_PASSWORD,
+    QUESTION_OTP,
+    QUESTION_UNKNOWN
+} question_type_t;
+typedef struct
+{
+    question_type_t value;
+    const char *match;
+    int match_state;
+
+    int (*fn)(int fd);
+} remote_question_entity_t;
+
+remote_question_entity_t all_questions[];
 
 // Some systems don't define posix_openpt
 #ifndef HAVE_POSIX_OPENPT
@@ -75,18 +100,20 @@ struct
         const char *password;
     } pwsrc;
 
-    const char *pwprompt;
+    const char *otp_file;
+    char *initial_command;
     int verbose;
 } args;
 
 static void show_help()
 {
-    printf("Usage: " PACKAGE_NAME " [-f|-d|-p|-e] [-hV] command parameters\n"
+    printf("Usage: " PACKAGE_NAME " [-f|-d|-p|-e] -o <key_file> [-hV] command parameters\n"
                "   -f filename   Take password to use from file\n"
                "   -d number     Use number as file descriptor for getting password\n"
                "   -p password   Provide password as argument (security unwise)\n"
                "   -e            Password is passed as env-var \"SSHPASS\"\n"
                "   With no parameters - password will be taken from stdin\n\n"
+               "   -o <key_file> The file which stores the key of otp\n"
                "   -P prompt     Which string should sshpass search for to detect a password prompt\n"
                "   -v            Be verbose about what you're doing\n"
                "   -h            Show help (this screen)\n"
@@ -109,7 +136,7 @@ static int parse_options(int argc, char *argv[])
     fprintf(stderr, "Conflicting password source\n"); \
     error=RETURN_CONFLICTING_ARGUMENTS; }
 
-    while ((opt = getopt(argc, argv, "+f:d:p:P:heVv")) != -1 && error == -1) {
+    while ((opt = getopt(argc, argv, "+f:d:p:P:heo:c:Vv")) != -1 && error == -1) {
         switch (opt) {
         case 'f':
             // Password should come from a file
@@ -141,7 +168,8 @@ static int parse_options(int argc, char *argv[])
             }
             break;
         case 'P':
-            args.pwprompt = optarg;
+            assert(all_questions[QUESTION_PASSWORD].value == QUESTION_PASSWORD);
+            all_questions[QUESTION_PASSWORD].match = strdup(optarg); // FIXME memory leak
             break;
         case 'v':
             args.verbose++;
@@ -156,6 +184,12 @@ static int parse_options(int argc, char *argv[])
 
                 error = RETURN_INVALID_ARGUMENTS;
             }
+            break;
+        case 'o':
+            args.otp_file = strdup(optarg);
+            break;
+        case 'c':
+            args.initial_command = strdup(optarg);
             break;
         case 'h':
             error = RETURN_NOERROR;
@@ -329,119 +363,88 @@ int runprogram(int argc, char *argv[])
 
     sigprocmask(SIG_SETMASK, &sigmask, NULL);
 
+    int ret;
     do {
-        if (!terminate) {
-            fd_set readfd;
+        fd_set readfd;
 
-            FD_ZERO(&readfd);
-            FD_SET(masterpt, &readfd);
+        FD_ZERO(&readfd);
+        FD_SET(masterpt, &readfd);
 
-            int selret = pselect(masterpt + 1, &readfd, NULL, NULL, NULL, &sigmask_select);
+        int selret = pselect(masterpt + 1, &readfd, NULL, NULL, NULL, &sigmask_select);
 
-            if (selret > 0) {
-                if (FD_ISSET(masterpt, &readfd)) {
-                    int ret;
-                    if ((ret = handleoutput(masterpt))) {
-                        // Authentication failed or any other error
-
-                        // handleoutput returns positive error number in case of some error, and a negative value
-                        // if all that happened is that the slave end of the pt is closed.
-                        if (ret > 0) {
-                            close(masterpt); // Signal ssh that it's controlling TTY is now closed
-                            close(slavept);
-                        }
-
-                        terminate = ret;
-
-                        if (terminate) {
-                            close(slavept);
-                        }
-                    }
-                }
-            }
-            wait_id = waitpid(childpid, &status, WNOHANG);
-        } else {
-            wait_id = waitpid(childpid, &status, 0);
+        if (selret <= 0) {
+            perror("pselect");
+            continue;
         }
-    } while (wait_id == 0 || (!WIFEXITED(status) && !WIFSIGNALED(status)));
 
-    if (terminate > 0)
-        return terminate;
+        if (!FD_ISSET(masterpt, &readfd))
+            continue;
+
+        ret = handleoutput(masterpt);
+        if (ret == RETURN_PARSE_ERRROR) {
+            ret = 0;
+            continue;
+        }
+    } while (!ret &&
+             (waitpid(childpid, &status, WNOHANG) == 0 ||
+              (!WIFEXITED(status) && !WIFSIGNALED(status))
+             ));
+
+    close(masterpt);
+    close(slavept);
+    if (ret > 0)
+        return ret;
     else if (WIFEXITED(status))
         return WEXITSTATUS(status);
     else
         return 255;
 }
 
-int match(const char *reference, const char *buffer, ssize_t bufsize, int state);
+int match(const char *reference, const char *buffer, ssize_t bufsize, int *pstate);
 
-void write_pass(int fd);
+remote_question_entity_t *parse_output(const char *output, uint size)
+{
+    remote_question_entity_t *entity = all_questions;
+    int state;
+    while (entity->fn) {
+        state = match(entity->match, output, size, &entity->match_state);
+        if (state) {
+            entity->match_state = 0;
+            return entity;
+        }
+        entity++;
+    }
+    return NULL;
+}
 
 int handleoutput(int fd)
 {
+    remote_question_entity_t *question;
     // We are looking for the string
-    static int prevmatch = 0; // If the "password" prompt is repeated, we have the wrong password.
-    static int state1, state2;
-    static int firsttime = 1;
-    static const char *compare1 = PASSWORD_PROMPT; // Asking for a password
-    static const char compare2[] = "The authenticity of host "; // Asks to authenticate host
-    // static const char compare3[]="WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"; // Warns about man in the middle attack
-    // The remote identification changed error is sent to stderr, not the tty, so we do not handle it.
-    // This is not a problem, as ssh exists immediately in such a case
     char buffer[256];
-    int ret = 0;
 
-    if (args.pwprompt) {
-        compare1 = args.pwprompt;
-    }
-
-    if (args.verbose && firsttime) {
-        firsttime = 0;
-        fprintf(stderr, "SSHPASS searching for password prompt using match \"%s\"\n", compare1);
-    }
-
-    int numread = read(fd, buffer, sizeof(buffer) - 1);
+    ssize_t numread = read(fd, buffer, sizeof(buffer) - 1);
+    if (numread < 0)
+        return -1;
     buffer[numread] = '\0';
     if (args.verbose) {
         fprintf(stderr, "SSHPASS read: %s\n", buffer);
     }
-
-    state1 = match(compare1, buffer, numread, state1);
-
-    // Are we at a password prompt?
-    if (compare1[state1] == '\0') {
-        if (!prevmatch) {
-            if (args.verbose)
-                fprintf(stderr, "SSHPASS detected prompt. Sending password.\n");
-            write_pass(fd);
-            state1 = 0;
-            prevmatch = 1;
-        } else {
-            // Wrong password - terminate with proper error code
-            if (args.verbose)
-                fprintf(stderr, "SSHPASS detected prompt, again. Wrong password. Terminating.\n");
-            ret = RETURN_INCORRECT_PASSWORD;
-        }
+    question = parse_output(buffer, (uint) numread);
+    if (!question) {
+        if (args.verbose)
+            fprintf(stderr, "Unknown output %s\n", buffer);
+        return RETURN_PARSE_ERRROR;
     }
 
-    if (ret == 0) {
-        state2 = match(compare2, buffer, numread, state2);
-
-        // Are we being prompted to authenticate the host?
-        if (compare2[state2] == '\0') {
-            if (args.verbose)
-                fprintf(stderr, "SSHPASS detected host authentication prompt. Exiting.\n");
-            ret = RETURN_HOST_KEY_UNKNOWN;
-        }
-    }
-
-    return ret;
+    return question->fn(fd);
 }
 
-int match(const char *reference, const char *buffer, ssize_t bufsize, int state)
+int match(const char *reference, const char *buffer, ssize_t bufsize, int *pstate)
 {
-    // This is a highly simplisic implementation. It's good enough for matching "Password: ", though.
+    // This is a highly simplisic implementation. It's good enough for matching "Password: ", though. No, its not enough.
     int i;
+    int state = pstate ? *pstate : 0;
     for (i = 0; reference[state] != '\0' && i < bufsize; ++i) {
         if (reference[state] == buffer[i])
             state++;
@@ -451,6 +454,9 @@ int match(const char *reference, const char *buffer, ssize_t bufsize, int state)
                 state++;
         }
     }
+
+    if (pstate)
+        *pstate = state;
 
     return state;
 }
@@ -489,7 +495,7 @@ void write_pass_fd(int srcfd, int dstfd)
     while (!done) {
         char buffer[40];
         int i;
-        int numread = read(srcfd, buffer, sizeof(buffer));
+        int numread = (int) read(srcfd, buffer, sizeof(buffer));
         done = (numread < 1);
         for (i = 0; i < numread && !done; ++i) {
             if (buffer[i] != '\n')
@@ -514,3 +520,133 @@ void window_resize_handler(int signum)
 void sigchld_handler(int signum)
 {
 }
+
+int handle_host_key_changed(int fd)
+{
+    if (args.verbose)
+        fprintf(stderr, "SSHPASS detected host identification changed. Exiting.\n");
+    return RETURN_HOST_KEY_CHANGED;
+}
+
+int handle_host_key_verify(int fd)
+{
+
+    if (args.verbose)
+        fprintf(stderr, "SSHPASS detected host authentication prompt. Exiting.\n");
+    return RETURN_HOST_KEY_UNKNOWN;
+}
+
+int handle_password(int fd)
+{
+    static int prevmatch = 0; // If the "password" prompt is repeated, we have the wrong password.
+    if (prevmatch) {
+        // Wrong password - terminate with proper error code
+        if (args.verbose)
+            fprintf(stderr, "SSHPASS detected prompt, again. Wrong password. Terminating.\n");
+        return RETURN_INCORRECT_PASSWORD;
+    }
+
+    if (args.verbose)
+        fprintf(stderr, "SSHPASS detected prompt. Sending password.\n");
+    write_pass(fd);
+    prevmatch = 1;
+    return RETURN_NOERROR;
+}
+
+void otp(const char *otp_secret, size_t secret_size, char code[7])
+{
+    time_t tick;
+    uint32_t tick_normal;
+    uint8_t message[8] = {0};
+    uint8_t sha_digest[SHA_DIGEST_LENGTH];
+    uint digest_len = sizeof(sha_digest);
+    int offset;
+    uint32_t number;
+
+    tick = time(NULL) / 30;
+    if (tick > UINT32_MAX) {
+        fprintf(stderr, "Excited!!\n");
+        abort();
+    }
+
+    tick_normal = htonl((uint32_t) tick);
+    memcpy(message + 4, &tick_normal, 4);
+
+    HMAC(EVP_sha1(), otp_secret, secret_size, message, sizeof(message), sha_digest, &digest_len);
+
+    offset = sha_digest[sizeof(sha_digest) - 1] & 0xf;
+    number = (ntohl(*(uint32_t *) (sha_digest + offset)) & 0x7fffffff) % 1000000;
+    snprintf(code, 7, "%06d", number);
+}
+
+int read_otp_key(const char *filename, char *key_buf, size_t max_key_size)
+{
+    int length = -1;
+    int fd;
+
+    fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        if (args.verbose) {
+            perror("open otp file");
+        }
+        return -1;
+    }
+
+    length = (int) read(fd, key_buf, max_key_size);
+
+    if (length < 0) {
+        if (args.verbose) {
+            perror("read otp file");
+        }
+    }
+
+    close(fd);
+    return length;
+}
+
+int handle_otp(int fd)
+{
+    static int try_times = 2;
+
+    if (!args.otp_file) {
+        if (args.verbose)
+            fprintf(stderr, "SSHPASS detected OTP prompt, but no OTP key given. Terminating.\n");
+        return RETURN_INCORRECT_PASSWORD;
+    }
+
+    if (!try_times) {
+        if (args.verbose)
+            fprintf(stderr, "SSHPASS detected OTP prompt, again. Wrong OTP key. Terminating.\n");
+        return RETURN_INCORRECT_PASSWORD;
+    }
+
+    --try_times;
+
+    if (args.verbose)
+        fprintf(stderr, "SSHPASS detected OTP prompt. Sending OTP.\n");
+
+    int otp_key_size;
+    char otp_key[4096], otp_code[7];
+
+    otp_key_size = read_otp_key(args.otp_file, otp_key, sizeof(otp_key));
+    if (otp_key_size < 0) {
+        return RETURN_INCORRECT_PASSWORD;
+    }
+
+    otp(otp_key, otp_key_size, otp_code);
+    write(fd, otp_code, sizeof(otp_code) - 1);
+    write(fd, "\n", 1);
+
+    return RETURN_NOERROR;
+}
+
+// Please keep the same order as question_type_t.
+remote_question_entity_t all_questions[] = {
+    // The remote identification changed error is sent to stderr, not the tty, so we do not handle it.
+    // This is not a problem, as ssh exists immediately in such a case
+    {QUESTION_HOST_KEY_CHANGED, "REMOTE HOST IDENTIFICATION HAS CHANGED", 0, handle_host_key_changed},
+    {QUESTION_HOST_KEY_VERIFY,  "The authenticity of host ",              0, handle_host_key_verify},
+    {QUESTION_PASSWORD, PASSWORD_PROMPT,                                  0, handle_password},
+    {QUESTION_OTP,      OTP_PROMPT,                                       0, handle_otp},
+    {0,                 NULL,                                             0, NULL}
+};

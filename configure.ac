@@ -13,6 +13,8 @@ AC_USE_SYSTEM_EXTENSIONS
 AC_PROG_CC
 
 # Checks for libraries.
+AC_CHECK_LIB([crypto], [EVP_EncryptInit], [],
+             [AC_MSG_FAILURE([can't find openssl crypto lib])])
 
 # Checks for header files.
 AC_HEADER_STDC
@@ -35,7 +37,12 @@ AC_CHECK_FUNCS([select posix_openpt strdup])
 AC_ARG_ENABLE([password-prompt],
         [AS_HELP_STRING([--enable-password-prompt=prompt], [Provide alternative ssh password prompt to look for.])],
         [AC_DEFINE_UNQUOTED([PASSWORD_PROMPT], ["$enable_password_prompt"], [Password prompt to use])],
-        [AC_DEFINE([PASSWORD_PROMPT], ["assword"])])
+        [AC_DEFINE([PASSWORD_PROMPT], ["[[EMAIL]] password"])])
+
+AC_ARG_ENABLE([otp-prompt],
+        [AS_HELP_STRING([--enable-otp-prompt=otp], [Provide alternative ssh OTP prompt to look for.])],
+        [AC_DEFINE_UNQUOTED([OTP_PROMPT], ["$enable_otp_prompt"], [OTP prompt to use])],
+        [AC_DEFINE([OTP_PROMPT], ["token"])])
 
 AC_CONFIG_FILES([Makefile])
 AM_CONFIG_HEADER(config.h)
